@@ -6,9 +6,15 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch:  # Allow manual trigger
 
+# Cancel any in-progress runs when a new one starts
+concurrency:
+  group: signal-monitor
+  cancel-in-progress: true
+
 jobs:
   check-signals:
     runs-on: ubuntu-latest
+    timeout-minutes: 4  # Kill job if it runs too long
 
     steps:
       - name: Checkout code

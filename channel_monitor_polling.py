@@ -1,6 +1,6 @@
 """
 100xclub Telegram Channel Monitor - Polling Version for GitHub Actions
-Enhanced with v2 Signal Detector + Image Analysis
+Enhanced with v2 Signal Detector + Image Analysis + Video Transcription
 """
 
 import asyncio
@@ -8,6 +8,8 @@ import re
 import os
 import base64
 import aiohttp
+import tempfile
+import subprocess
 from datetime import datetime, timedelta
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -311,6 +313,176 @@ If you cannot determine something, use null for that field."""
 
 
 # ============================================
+# VIDEO TRANSCRIPTION
+# ============================================
+
+async def transcribe_video(video_bytes, groq_api_key=None):
+    """
+    Transcribe video audio using Groq's Whisper API
+    Returns: dict with transcription and detected signals
+    """
+    if not groq_api_key:
+        return None
+
+    try:
+        # Save video to temp file
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_video:
+            tmp_video.write(video_bytes)
+            tmp_video_path = tmp_video.name
+
+        # Extract audio using ffmpeg (convert to mp3)
+        tmp_audio_path = tmp_video_path.replace('.mp4', '.mp3')
+
+        try:
+            # Try to extract audio with ffmpeg
+            result = subprocess.run(
+                ['ffmpeg', '-i', tmp_video_path, '-vn', '-acodec', 'libmp3lame',
+                 '-q:a', '4', '-y', tmp_audio_path],
+                capture_output=True,
+                timeout=60
+            )
+
+            if result.returncode != 0 or not os.path.exists(tmp_audio_path):
+                print(f"[WARN] ffmpeg audio extraction failed: {result.stderr.decode()[:200]}")
+                # Cleanup
+                os.unlink(tmp_video_path)
+                return None
+
+        except FileNotFoundError:
+            print("[WARN] ffmpeg not installed, cannot extract audio from video")
+            os.unlink(tmp_video_path)
+            return None
+        except subprocess.TimeoutExpired:
+            print("[WARN] ffmpeg timeout during audio extraction")
+            os.unlink(tmp_video_path)
+            return None
+
+        # Check audio file size (max 25MB for Groq)
+        audio_size = os.path.getsize(tmp_audio_path)
+        if audio_size > 25 * 1024 * 1024:
+            print(f"[WARN] Audio file too large ({audio_size / 1024 / 1024:.1f}MB), max 25MB")
+            os.unlink(tmp_video_path)
+            os.unlink(tmp_audio_path)
+            return None
+
+        # Read audio file
+        with open(tmp_audio_path, 'rb') as f:
+            audio_bytes = f.read()
+
+        # Cleanup temp files
+        os.unlink(tmp_video_path)
+        os.unlink(tmp_audio_path)
+
+        # Transcribe with Groq Whisper API
+        import aiohttp
+        from aiohttp import FormData
+
+        data = FormData()
+        data.add_field('file', audio_bytes, filename='audio.mp3', content_type='audio/mpeg')
+        data.add_field('model', 'whisper-large-v3-turbo')
+        data.add_field('response_format', 'json')
+        data.add_field('language', 'en')
+        data.add_field('prompt', 'This is a cryptocurrency trading video discussing coins like BTC, ETH, SOL, LINK and trading strategies.')
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                'https://api.groq.com/openai/v1/audio/transcriptions',
+                headers={
+                    'Authorization': f'Bearer {groq_api_key}'
+                },
+                data=data
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    transcription = result.get('text', '')
+                    print(f"[TRANSCRIBE] Got {len(transcription)} chars of transcription")
+
+                    # Extract trading signals from transcription
+                    signals = extract_signals_from_transcription(transcription)
+
+                    return {
+                        'transcription': transcription,
+                        'signals': signals,
+                        'coins': signals.get('coins', []),
+                        'direction': signals.get('direction'),
+                        'risk_reward': signals.get('risk_reward'),
+                    }
+                else:
+                    error_text = await response.text()
+                    print(f"[ERROR] Whisper API failed: {response.status} - {error_text[:200]}")
+                    return None
+
+    except Exception as e:
+        print(f"[ERROR] Video transcription error: {e}")
+        return None
+
+
+def extract_signals_from_transcription(transcription):
+    """
+    Extract trading signals from video transcription text
+    """
+    text = transcription.lower()
+    result = {
+        'coins': [],
+        'direction': None,
+        'risk_reward': None,
+        'entry': None,
+        'stop_loss': None,
+        'target': None,
+    }
+
+    # Find coins mentioned
+    coin_matches = COIN_PATTERN.findall(transcription)
+    result['coins'] = list(set(c.upper() for c in coin_matches))
+
+    # Filter out stablecoins
+    result['coins'] = [c for c in result['coins'] if c not in ['USDT', 'USDC', 'DAI', 'BUSD']]
+
+    # Direction detection
+    long_patterns = [
+        r'\b(going long|longing|long position|bullish on|buying|accumulating)\b',
+        r'\b(i.m long|i am long|we.re long|we are long)\b',
+        r'\b(long\s+(?:' + '|'.join(COINS[:20]) + r'))\b',
+    ]
+    short_patterns = [
+        r'\b(going short|shorting|short position|bearish on|selling)\b',
+        r'\b(i.m short|i am short|we.re short|we are short)\b',
+        r'\b(short\s+(?:' + '|'.join(COINS[:20]) + r'))\b',
+    ]
+
+    for pattern in long_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            result['direction'] = 'LONG'
+            break
+
+    if not result['direction']:
+        for pattern in short_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                result['direction'] = 'SHORT'
+                break
+
+    # Risk/Reward detection
+    rr_patterns = [
+        r'(\d+(?:\.\d+)?)\s*(?:to|:)\s*(\d+(?:\.\d+)?)\s*(?:risk|r)\s*(?:to|:)?\s*(?:reward|r)',
+        r'(?:risk|r)\s*(?:to|:)?\s*(?:reward|r)\s*(?:of|is|:)?\s*(\d+(?:\.\d+)?)\s*(?:to|:)\s*(\d+(?:\.\d+)?)',
+        r'(\d+(?:\.\d+)?)\s*r\s*(?:to|:)\s*(\d+(?:\.\d+)?)\s*r',
+    ]
+
+    for pattern in rr_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            result['risk_reward'] = f"{match.group(1)}:{match.group(2)}"
+            break
+
+    # Also check for simple "X to 1" pattern
+    simple_rr = re.search(r'(\d+(?:\.\d+)?)\s*to\s*1\s*(?:risk|reward)?', text, re.IGNORECASE)
+    if simple_rr and not result['risk_reward']:
+        result['risk_reward'] = f"1:{simple_rr.group(1)}"
+
+    return result
+
+
+# ============================================
 # NOTIFICATION
 # ============================================
 
@@ -337,6 +509,13 @@ async def send_telegram_notification(signal_data):
         message_parts.append(f"Targets: {', '.join(signal_data['targets'])}")
     if signal_data.get('leverage'):
         message_parts.append(f"Leverage: {signal_data['leverage']}x")
+
+    if signal_data.get('risk_reward'):
+        message_parts.append(f"Risk/Reward: {signal_data['risk_reward']}")
+
+    if signal_data.get('has_video'):
+        message_parts.append(f"")
+        message_parts.append(f"*[From Video Analysis]*")
 
     if signal_data.get('has_chart') and signal_data.get('chart_analysis'):
         chart = signal_data['chart_analysis']
@@ -385,7 +564,7 @@ async def send_telegram_notification(signal_data):
 
 async def main():
     print("=" * 60)
-    print("100xclub Channel Monitor - Polling Mode (v2 Enhanced)")
+    print("100xclub Channel Monitor - Polling Mode (v2 Enhanced + Video)")
     print(f"Checking messages from last {CHECK_MINUTES} minutes")
     print("=" * 60)
 
@@ -432,12 +611,53 @@ async def main():
             except Exception as e:
                 print(f"[WARN] Could not analyze image: {e}")
 
+        # Check for videos - transcribe audio
+        video_analysis = None
+        if message.video and GROQ_API_KEY:
+            try:
+                # Check video size (limit to ~50MB to avoid long downloads)
+                video_size = getattr(message.video, 'size', 0)
+                if video_size and video_size < 50 * 1024 * 1024:
+                    print(f"[VIDEO] Downloading video ({video_size / 1024 / 1024:.1f}MB)...")
+                    video_bytes = await client.download_media(message.video, bytes)
+                    video_analysis = await transcribe_video(video_bytes, GROQ_API_KEY)
+                    if video_analysis:
+                        print(f"[VIDEO] Transcription signals: {video_analysis.get('coins')} - {video_analysis.get('direction')}")
+                        # Append transcription to text for signal detection
+                        if video_analysis.get('transcription'):
+                            text = text + "\n\n[VIDEO TRANSCRIPTION]:\n" + video_analysis['transcription']
+                else:
+                    print(f"[VIDEO] Skipping large video ({video_size / 1024 / 1024:.1f}MB)")
+            except Exception as e:
+                print(f"[WARN] Could not transcribe video: {e}")
+
+        # Combine image and video analysis
+        combined_analysis = image_analysis
+        if video_analysis:
+            if not combined_analysis:
+                combined_analysis = {}
+            # Merge video coins into analysis
+            if video_analysis.get('coins'):
+                existing_coins = combined_analysis.get('coins', [])
+                combined_analysis['coins'] = list(set(existing_coins + video_analysis['coins']))
+            if video_analysis.get('direction') and not combined_analysis.get('direction'):
+                combined_analysis['direction'] = video_analysis['direction']
+            if video_analysis.get('risk_reward'):
+                combined_analysis['risk_reward'] = video_analysis['risk_reward']
+            combined_analysis['has_video'] = True
+            combined_analysis['transcription'] = video_analysis.get('transcription', '')[:500]
+
         # Detect signal
-        signal = SignalDetector.detect(text, image_analysis)
+        signal = SignalDetector.detect(text, combined_analysis)
 
         if signal and signal['detected']:
             signal['timestamp'] = message.date.isoformat()
             signal['message_id'] = message.id
+            # Add video-specific info
+            if video_analysis:
+                signal['has_video'] = True
+                if video_analysis.get('risk_reward'):
+                    signal['risk_reward'] = video_analysis['risk_reward']
             signals_found += 1
 
             print(f"[SIGNAL] {signal['coins']} - {signal['direction']} ({signal['action']})")
