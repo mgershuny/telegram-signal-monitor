@@ -1,6 +1,7 @@
 """
 100xclub Telegram Channel Monitor - Render.com Version
-Uses environment variables and base64-encoded session string
+Enhanced with v2 Signal Detector + Image Analysis + Video Transcription
+Uses event-driven real-time monitoring (not polling)
 """
 
 import asyncio
@@ -8,6 +9,8 @@ import re
 import os
 import base64
 import aiohttp
+import tempfile
+import subprocess
 from datetime import datetime
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -21,91 +24,483 @@ API_HASH = os.environ.get('TELEGRAM_API_HASH', 'a0294468ed3f843181e88417cc6cd271
 SESSION_STRING = os.environ.get('TELEGRAM_SESSION', '')
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '8327044619:AAEqx5cegbQzYD3XOKP8GG4_jrwnEu7rRqg')
 CHAT_ID = int(os.environ.get('CHAT_ID', '1203745980'))
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 
 # ============================================
-# TRADE SIGNAL DETECTION
+# EXPANDED COIN LIST
 # ============================================
 
-TRADE_KEYWORDS = ['long', 'short', 'buy', 'sell', 'entry', 'target', 'tp', 'sl', 'stop loss', 'take profit']
-COIN_PATTERN = re.compile(r'\b(BTC|ETH|SOL|XRP|ADA|DOGE|AVAX|DOT|LINK|MATIC|UNI|ATOM|LTC|BCH|NEAR|APT|ARB|OP|SUI|SEI|TIA|JUP|BONK|WIF|PEPE|SHIB|FLOKI|INJ|FET|RENDER|TAO|WLD|STRK|MANTA|DYM|ALT|PIXEL|PORTAL|AEVO)\b', re.IGNORECASE)
+COINS = [
+    # Major
+    'BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'ADA', 'DOGE', 'AVAX', 'DOT', 'LINK',
+    'MATIC', 'POL', 'UNI', 'ATOM', 'LTC', 'BCH', 'NEAR', 'APT', 'ARB', 'OP',
+    # Layer 1/2
+    'SUI', 'SEI', 'TIA', 'INJ', 'FTM', 'ALGO', 'HBAR', 'VET', 'FIL', 'ICP',
+    'EGLD', 'XLM', 'XMR', 'EOS', 'FLOW', 'MINA', 'KAVA', 'ZIL', 'ONE', 'ROSE',
+    # DeFi
+    'AAVE', 'MKR', 'CRV', 'SNX', 'COMP', 'SUSHI', 'YFI', 'LIDO', 'LDO', 'RPL',
+    'GMX', 'DYDX', 'JUP', 'RAY', 'ORCA', 'PENDLE', 'JTO', 'PYTH', 'W', 'ENA',
+    # Gaming/Metaverse
+    'SAND', 'MANA', 'AXS', 'GALA', 'ENJ', 'IMX', 'GMT', 'APE', 'BLUR', 'MAGIC',
+    'PRIME', 'PIXEL', 'PORTAL', 'AEVO', 'RONIN', 'RON',
+    # AI
+    'FET', 'RENDER', 'RNDR', 'TAO', 'WLD', 'OCEAN', 'AGIX', 'NMR', 'ARKM',
+    # Memes
+    'BONK', 'WIF', 'PEPE', 'SHIB', 'FLOKI', 'MEME', 'MOODENG', 'PNUT', 'ACT',
+    'VIRTUAL', 'AI16Z', 'FARTCOIN', 'GOAT', 'POPCAT', 'MEW', 'NEIRO', 'TURBO',
+    # New/Hot
+    'STRK', 'MANTA', 'DYM', 'ALT', 'ONDO', 'ETHFI', 'EIGEN', 'ZRO', 'BLAST',
+    'TRUMP', 'MELANIA', 'BOME', 'SLERF', 'BRETT', 'MOTHER', 'DADDY',
+    # Others
+    'TON', 'KAS', 'STX', 'ORDI', 'RUNE', 'TRX', 'LEO', 'OKB', 'CRO', 'MNT',
+    'CAKE', 'OSMO', 'AKT', 'RNDR', 'AR', 'GRT', 'THETA', 'XTZ', 'ALGO', 'IOTA',
+    # Stables (for detection)
+    'USDT', 'USDC', 'DAI', 'BUSD'
+]
 
-def parse_trade_signal(text):
-    """Parse a message to extract trade signal information"""
-    if not text:
-        return None
+COIN_PATTERN = re.compile(r'\b(' + '|'.join(COINS) + r')\b', re.IGNORECASE)
 
-    text_lower = text.lower()
+# ============================================
+# ENHANCED SIGNAL DETECTOR V2
+# ============================================
 
-    # Check for trade keywords
-    keyword_count = sum(1 for kw in TRADE_KEYWORDS if kw in text_lower)
-    if keyword_count < 2:
-        return None
+class SignalDetector:
+    DIRECT_ACTION_PATTERNS = [
+        (r'\b(longed|shorted|bought|sold)\s+([A-Z]{2,6})\b', 'direct_action'),
+        (r'\b(long|short)\s+([A-Z]{2,6})\b', 'direct_action'),
+        (r'\b([A-Z]{2,6})\s+(long|short)\b', 'direct_action_reverse'),
+        (r'\btook\s+(?:a\s+)?(?:this\s+)?([A-Z]{2,6})?\s*(long|short)\b', 'took_position'),
+        (r'\btook\s+(?:a\s+)?(?:this\s+)?(long|short)\s+(?:on\s+)?([A-Z]{2,6})\b', 'took_position'),
+        (r'\btaking\s+(?:this\s+)?([A-Z]{2,6})?\s*(long|short)\b', 'taking_position'),
+        (r'\bentered?\s+(?:a\s+)?([A-Z]{2,6})?\s*(long|short)\b', 'entered_position'),
+        (r'\badded\s+(?:to\s+)?(?:my\s+)?([A-Z]{2,6})?\s*(long|short)\b', 'added_position'),
+    ]
 
-    # Extract coins
-    coin_matches = COIN_PATTERN.findall(text)
-    coins = list(set(c.upper() for c in coin_matches))
+    SCALP_PATTERNS = [
+        (r'\bscalp\s+(long|short)\s+([A-Z]{2,6})\b', 'scalp'),
+        (r'\b([A-Z]{2,6})\s+scalp\s+(long|short)\b', 'scalp_reverse'),
+        (r'\bscalp(?:ed|ing)?\s+([A-Z]{2,6})\b', 'scalp_coin'),
+        (r'\btook\s+(?:a\s+)?(?:this\s+)?([A-Z]{2,6})?\s*scalp\s*(long|short)?\b', 'took_scalp'),
+    ]
 
-    if not coins:
-        return None
+    UPDATE_PATTERNS = [
+        (r'\b(?:updated?|new)\s+([A-Z]{2,6})?\s*(?:sl|stop\s*loss|tp|take\s*profit)\b', 'update'),
+        (r'\b([A-Z]{2,6})\s+(?:sl|stop\s*loss|tp|take\s*profit)\s*(?:updated?|changed?|moved?)\b', 'update_reverse'),
+        (r'\bsl\s+(?:at|to|@)\s*\$?([\d,.]+)\b', 'sl_level'),
+        (r'\btp\s+(?:at|to|@)\s*\$?([\d,.]+)\b', 'tp_level'),
+    ]
 
-    # Detect direction
-    direction = None
-    if re.search(r'\b(long|buy|bullish|going long)\b', text_lower):
-        direction = 'LONG'
-    elif re.search(r'\b(short|sell|bearish|going short)\b', text_lower):
-        direction = 'SHORT'
+    CLOSE_PATTERNS = [
+        (r'\bclosed?\s+(?:my\s+)?(?:the\s+)?([A-Z]{2,6})?\s*(long|short)?\b', 'closed'),
+        (r'\bclosing\s+(?:my\s+)?(?:the\s+)?([A-Z]{2,6})?\s*(long|short)?\b', 'closing'),
+        (r'\bexited?\s+(?:my\s+)?(?:the\s+)?([A-Z]{2,6})?\s*(long|short)?\b', 'exited'),
+        (r'\breduced?\s+(?:my\s+)?([A-Z]{2,6})?\s*(long|short)?\b', 'reduced'),
+    ]
 
-    # Extract entry price
-    entry_match = re.search(r'(?:entry|enter|buy at|sell at)[:\s]*\$?([\d,]+\.?\d*)', text_lower)
-    entry = entry_match.group(1).replace(',', '') if entry_match else None
-
-    # Extract targets
-    target_matches = re.findall(r'(?:tp|target|take profit)[:\s]*\$?([\d,]+\.?\d*)', text_lower)
-    targets = [t.replace(',', '') for t in target_matches] if target_matches else []
-
-    # Extract stop loss
-    sl_match = re.search(r'(?:sl|stop ?loss|stop)[:\s]*\$?([\d,]+\.?\d*)', text_lower)
-    stop_loss = sl_match.group(1).replace(',', '') if sl_match else None
-
-    # Extract leverage
-    leverage_match = re.search(r'(\d+)x', text_lower)
-    leverage = leverage_match.group(1) if leverage_match else None
-
-    return {
-        'coins': coins,
-        'direction': direction or 'Unknown',
-        'entry': entry,
-        'targets': targets,
-        'stop_loss': stop_loss,
-        'leverage': leverage,
-        'raw_text': text[:500]
+    TRADING_KEYWORDS = {
+        'high_confidence': ['longed', 'shorted', 'scalp', 'entry', 'sl', 'tp', 'stop loss', 'take profit'],
+        'medium_confidence': ['long', 'short', 'buy', 'sell', 'target', 'position'],
+        'action_verbs': ['took', 'taking', 'entered', 'entering', 'closed', 'closing', 'added', 'reduced', 'exited'],
     }
 
+    INTENT_PATTERNS = [
+        (r'\b(i am|im|i\'m)\s+(longing|shorting|long|short)\b', 'self_action'),
+        (r'\b(longing|shorting)\s+(here|now|this)?\b', 'action_now'),
+        (r'\b(going|went)\s+(long|short)\b', 'going_direction'),
+        (r'\bam\s+(long|short)\b', 'am_position'),
+    ]
+
+    @classmethod
+    def detect(cls, text, media_analysis=None):
+        if not text or len(text) < 5:
+            # If no text but we have media analysis with coins, still process
+            if not media_analysis or not media_analysis.get('coins'):
+                return None
+
+        text_lower = (text or '').lower()
+        result = {
+            'detected': False,
+            'confidence': 0,
+            'methods': [],
+            'coins': [],
+            'direction': None,
+            'action': None,
+            'entry': None,
+            'stop_loss': None,
+            'targets': [],
+            'leverage': None,
+            'has_chart': False,
+            'has_video': False,
+            'chart_analysis': None,
+            'risk_reward': None,
+            'raw_text': (text or '')[:500]
+        }
+
+        # Extract coins from text
+        if text:
+            coin_matches = COIN_PATTERN.findall(text)
+            result['coins'] = list(set(c.upper() for c in coin_matches))
+
+        tradeable_coins = [c for c in result['coins'] if c not in ['USDT', 'USDC', 'DAI', 'BUSD']]
+
+        # If we have media analysis, use it
+        if media_analysis:
+            if media_analysis.get('has_video'):
+                result['has_video'] = True
+            else:
+                result['has_chart'] = True
+            result['chart_analysis'] = media_analysis
+
+            if media_analysis.get('coins'):
+                for coin in media_analysis['coins']:
+                    if coin.upper() not in result['coins'] and coin.upper() != 'UNKNOWN':
+                        result['coins'].append(coin.upper())
+                        tradeable_coins.append(coin.upper())
+            if media_analysis.get('direction'):
+                result['direction'] = media_analysis['direction']
+            if media_analysis.get('risk_reward'):
+                result['risk_reward'] = media_analysis['risk_reward']
+            result['confidence'] += 30
+
+        # Check for intent patterns
+        if text:
+            for pattern, method_name in cls.INTENT_PATTERNS:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    result['methods'].append(f'intent:{method_name}')
+                    result['confidence'] += 35
+                    groups = match.groups()
+                    for g in groups:
+                        if g and g.lower() in ['long', 'longing']:
+                            result['direction'] = 'LONG'
+                            result['action'] = 'OPEN'
+                        elif g and g.lower() in ['short', 'shorting']:
+                            result['direction'] = 'SHORT'
+                            result['action'] = 'OPEN'
+
+        if not tradeable_coins:
+            return None
+
+        # Pattern matching
+        if text:
+            all_patterns = [
+                (cls.DIRECT_ACTION_PATTERNS, 40, 'OPEN'),
+                (cls.SCALP_PATTERNS, 35, 'SCALP'),
+                (cls.UPDATE_PATTERNS, 25, 'UPDATE'),
+                (cls.CLOSE_PATTERNS, 30, 'CLOSE'),
+            ]
+
+            for patterns, base_confidence, action_type in all_patterns:
+                for pattern, method_name in patterns:
+                    match = re.search(pattern, text, re.IGNORECASE)
+                    if match:
+                        result['detected'] = True
+                        result['methods'].append(f'{action_type.lower()}:{method_name}')
+                        result['confidence'] += base_confidence
+                        if not result['action']:
+                            result['action'] = action_type
+
+                        groups = match.groups()
+                        for g in groups:
+                            if g and g.lower() in ['long', 'longed', 'bought', 'buy']:
+                                result['direction'] = 'LONG'
+                            elif g and g.lower() in ['short', 'shorted', 'sold', 'sell']:
+                                result['direction'] = 'SHORT'
+
+            # Keyword confidence
+            for kw in cls.TRADING_KEYWORDS['high_confidence']:
+                if kw in text_lower:
+                    result['confidence'] += 10
+            for kw in cls.TRADING_KEYWORDS['medium_confidence']:
+                if kw in text_lower:
+                    result['confidence'] += 5
+            for kw in cls.TRADING_KEYWORDS['action_verbs']:
+                if kw in text_lower:
+                    result['confidence'] += 8
+
+            # Leverage
+            leverage_match = re.search(r'(\d+)x\b', text_lower)
+            if leverage_match:
+                result['leverage'] = leverage_match.group(1)
+                result['confidence'] += 5
+
+        # Direction fallback
+        if not result['direction']:
+            if text and re.search(r'\b(long|buy|bullish)\b', text_lower):
+                result['direction'] = 'LONG'
+            elif text and re.search(r'\b(short|sell|bearish)\b', text_lower):
+                result['direction'] = 'SHORT'
+            else:
+                result['direction'] = 'Unknown'
+
+        if result['confidence'] >= 15:
+            result['detected'] = True
+            return result
+
+        return None
+
+
+# ============================================
+# CHART/IMAGE ANALYSIS
+# ============================================
+
+async def analyze_chart_image(image_bytes, groq_api_key=None):
+    if not groq_api_key:
+        return None
+
+    try:
+        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+
+        prompt = """Analyze this trading chart image. Extract:
+1. What cryptocurrency/coin is shown? (e.g., BTC, ETH, SOL)
+2. What timeframe? (1m, 5m, 15m, 1h, 4h, 1d)
+3. Is the chart showing a LONG (bullish) or SHORT (bearish) setup?
+4. Any key levels visible (support, resistance, entry, stop loss, targets)?
+5. Any patterns visible (breakout, breakdown, consolidation, trend)?
+
+Respond in this exact JSON format:
+{
+  "coins": ["BTC"],
+  "timeframe": "4h",
+  "direction": "LONG",
+  "key_levels": {"entry": "95000", "stop_loss": "93500", "target": "100000"},
+  "pattern": "breakout above resistance",
+  "confidence": 85
+}
+
+If you cannot determine something, use null for that field."""
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                'https://api.groq.com/openai/v1/chat/completions',
+                headers={
+                    'Authorization': f'Bearer {groq_api_key}',
+                    'Content-Type': 'application/json'
+                },
+                json={
+                    'model': 'meta-llama/llama-4-scout-17b-16e-instruct',
+                    'messages': [
+                        {
+                            'role': 'user',
+                            'content': [
+                                {'type': 'text', 'text': prompt},
+                                {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{image_base64}'}}
+                            ]
+                        }
+                    ],
+                    'max_tokens': 500
+                }
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    content = data['choices'][0]['message']['content']
+                    import json
+                    try:
+                        json_match = re.search(r'\{[^{}]*\}', content, re.DOTALL)
+                        if json_match:
+                            return json.loads(json_match.group())
+                    except:
+                        pass
+                    return {'raw_analysis': content}
+                else:
+                    print(f"[WARN] Chart analysis failed: {response.status}")
+                    return None
+    except Exception as e:
+        print(f"[ERROR] Chart analysis error: {e}")
+        return None
+
+
+# ============================================
+# VIDEO TRANSCRIPTION
+# ============================================
+
+async def transcribe_video(video_bytes, groq_api_key=None):
+    if not groq_api_key:
+        return None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_video:
+            tmp_video.write(video_bytes)
+            tmp_video_path = tmp_video.name
+
+        tmp_audio_path = tmp_video_path.replace('.mp4', '.mp3')
+
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-i', tmp_video_path, '-vn', '-acodec', 'libmp3lame',
+                 '-q:a', '4', '-y', tmp_audio_path],
+                capture_output=True,
+                timeout=60
+            )
+
+            if result.returncode != 0 or not os.path.exists(tmp_audio_path):
+                print(f"[WARN] ffmpeg audio extraction failed")
+                os.unlink(tmp_video_path)
+                return None
+
+        except FileNotFoundError:
+            print("[WARN] ffmpeg not installed")
+            os.unlink(tmp_video_path)
+            return None
+        except subprocess.TimeoutExpired:
+            print("[WARN] ffmpeg timeout")
+            os.unlink(tmp_video_path)
+            return None
+
+        audio_size = os.path.getsize(tmp_audio_path)
+        if audio_size > 25 * 1024 * 1024:
+            print(f"[WARN] Audio too large ({audio_size / 1024 / 1024:.1f}MB)")
+            os.unlink(tmp_video_path)
+            os.unlink(tmp_audio_path)
+            return None
+
+        with open(tmp_audio_path, 'rb') as f:
+            audio_bytes = f.read()
+
+        os.unlink(tmp_video_path)
+        os.unlink(tmp_audio_path)
+
+        from aiohttp import FormData
+
+        data = FormData()
+        data.add_field('file', audio_bytes, filename='audio.mp3', content_type='audio/mpeg')
+        data.add_field('model', 'whisper-large-v3-turbo')
+        data.add_field('response_format', 'json')
+        data.add_field('language', 'en')
+        data.add_field('prompt', 'Cryptocurrency trading video discussing coins like BTC, ETH, SOL, LINK and trading strategies.')
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                'https://api.groq.com/openai/v1/audio/transcriptions',
+                headers={'Authorization': f'Bearer {groq_api_key}'},
+                data=data
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    transcription = result.get('text', '')
+                    print(f"[TRANSCRIBE] Got {len(transcription)} chars")
+                    signals = extract_signals_from_transcription(transcription)
+                    return {
+                        'transcription': transcription,
+                        'signals': signals,
+                        'coins': signals.get('coins', []),
+                        'direction': signals.get('direction'),
+                        'risk_reward': signals.get('risk_reward'),
+                        'has_video': True,
+                    }
+                else:
+                    print(f"[ERROR] Whisper API failed: {response.status}")
+                    return None
+
+    except Exception as e:
+        print(f"[ERROR] Video transcription error: {e}")
+        return None
+
+
+def extract_signals_from_transcription(transcription):
+    text = transcription.lower()
+    result = {
+        'coins': [],
+        'direction': None,
+        'risk_reward': None,
+    }
+
+    coin_matches = COIN_PATTERN.findall(transcription)
+    result['coins'] = list(set(c.upper() for c in coin_matches))
+    result['coins'] = [c for c in result['coins'] if c not in ['USDT', 'USDC', 'DAI', 'BUSD']]
+
+    long_patterns = [
+        r'\b(going long|longing|long position|bullish on|buying|accumulating)\b',
+        r'\b(i.m long|i am long|we.re long|we are long)\b',
+    ]
+    short_patterns = [
+        r'\b(going short|shorting|short position|bearish on|selling)\b',
+        r'\b(i.m short|i am short|we.re short|we are short)\b',
+    ]
+
+    for pattern in long_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            result['direction'] = 'LONG'
+            break
+
+    if not result['direction']:
+        for pattern in short_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                result['direction'] = 'SHORT'
+                break
+
+    rr_patterns = [
+        r'(\d+(?:\.\d+)?)\s*(?:to|:)\s*(\d+(?:\.\d+)?)\s*(?:risk|r)\s*(?:to|:)?\s*(?:reward|r)',
+        r'(?:risk|r)\s*(?:to|:)?\s*(?:reward|r)\s*(?:of|is|:)?\s*(\d+(?:\.\d+)?)\s*(?:to|:)\s*(\d+(?:\.\d+)?)',
+    ]
+
+    for pattern in rr_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            result['risk_reward'] = f"{match.group(1)}:{match.group(2)}"
+            break
+
+    simple_rr = re.search(r'(\d+(?:\.\d+)?)\s*to\s*1\s*(?:risk|reward)?', text, re.IGNORECASE)
+    if simple_rr and not result['risk_reward']:
+        result['risk_reward'] = f"1:{simple_rr.group(1)}"
+
+    return result
+
+
+# ============================================
+# NOTIFICATION
+# ============================================
+
 async def send_telegram_notification(signal_data):
-    """Send notification directly via bot"""
     coins_str = ', '.join(signal_data['coins'])
-    direction_emoji = '📈' if signal_data['direction'] == 'LONG' else '📉'
+    direction_emoji = '📈' if signal_data['direction'] == 'LONG' else '📉' if signal_data['direction'] == 'SHORT' else '❓'
+    action = signal_data.get('action', 'TRADE')
 
-    message = f"""🚨 *NEW 100XCLUB TRADE SIGNAL* 🚨
+    message_parts = [
+        f"🚨 *NEW 100XCLUB SIGNAL* 🚨",
+        f"",
+        f"⏰ Time: {signal_data['timestamp']}",
+        f"📊 Confidence: {signal_data['confidence']}%",
+        f"",
+        f"{direction_emoji} *{signal_data['direction']} {coins_str}* ({action})",
+    ]
 
-📡 Source: Telegram Channel (Auto-Detected)
-⏰ Time: {signal_data['timestamp']}
+    if signal_data.get('entry'):
+        message_parts.append(f"💰 Entry: ${signal_data['entry']}")
+    if signal_data.get('stop_loss'):
+        message_parts.append(f"🛑 Stop Loss: ${signal_data['stop_loss']}")
+    if signal_data.get('targets'):
+        message_parts.append(f"🎯 Targets: {', '.join(signal_data['targets'])}")
+    if signal_data.get('leverage'):
+        message_parts.append(f"⚡ Leverage: {signal_data['leverage']}x")
+    if signal_data.get('risk_reward'):
+        message_parts.append(f"📐 Risk/Reward: {signal_data['risk_reward']}")
 
-🪙 Coin(s): *{coins_str}*
-{direction_emoji} Direction: *{signal_data['direction']}*
-💰 Entry: {signal_data.get('entry') or 'Not specified'}
-🎯 Targets: {', '.join(signal_data.get('targets', [])) or 'Not specified'}
-🛑 Stop Loss: {signal_data.get('stop_loss') or 'Not specified'}
-⚡ Leverage: {signal_data.get('leverage') or 'Not specified'}x
+    if signal_data.get('has_video'):
+        message_parts.append(f"")
+        message_parts.append(f"🎬 *[From Video Analysis]*")
 
-📝 Signal:
-```
-{signal_data['raw_text'][:300]}
-```
+    if signal_data.get('has_chart') and signal_data.get('chart_analysis'):
+        chart = signal_data['chart_analysis']
+        message_parts.append(f"")
+        message_parts.append(f"📊 *Chart Analysis:*")
+        if chart.get('timeframe'):
+            message_parts.append(f"⏱ Timeframe: {chart['timeframe']}")
+        if chart.get('pattern'):
+            message_parts.append(f"📈 Pattern: {chart['pattern']}")
 
-⚠️ Reply with:
-• `APPROVE {signal_data['coins'][0]} {signal_data['direction']} 50` to trade $50
-• `SKIP` to ignore"""
+    message_parts.append(f"")
+    message_parts.append(f"📝 Signal:")
+    message_parts.append(f"```")
+    clean_text = signal_data['raw_text'][:200].encode('ascii', 'ignore').decode('ascii')
+    message_parts.append(clean_text)
+    message_parts.append(f"```")
+    message_parts.append(f"")
+    message_parts.append(f"⚠️ Reply:")
+    message_parts.append(f"`APPROVE {signal_data['coins'][0]} {signal_data['direction']} 50` for $50")
+    message_parts.append(f"`SKIP` to ignore")
+
+    message = '\n'.join(message_parts)
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
@@ -118,30 +513,32 @@ async def send_telegram_notification(signal_data):
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as response:
                 if response.status == 200:
-                    print(f"[OK] Notification sent for: {coins_str}")
+                    print(f"[OK] Notification sent: {coins_str} {signal_data['direction']}")
                 else:
                     text = await response.text()
-                    print(f"[ERROR] Telegram notification failed: {response.status} - {text}")
+                    print(f"[ERROR] Telegram failed: {response.status} - {text}")
     except Exception as e:
         print(f"[ERROR] Telegram error: {e}")
 
+
+# ============================================
+# MAIN - EVENT-DRIVEN MONITORING
+# ============================================
+
 async def main():
-    print("=" * 50)
-    print("100xclub Telegram Channel Monitor (Render)")
-    print("=" * 50)
+    print("=" * 60)
+    print("100xclub Channel Monitor - Render.com (Real-time + Video)")
+    print("=" * 60)
 
     if not SESSION_STRING:
-        print("[ERROR] No TELEGRAM_SESSION environment variable set!")
-        print("[INFO] Run generate_session.py locally first to get the session string")
+        print("[ERROR] No TELEGRAM_SESSION set!")
         return
 
-    # Create client using StringSession
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-
     await client.start()
     print("[OK] Connected to Telegram")
 
-    # Find the 100xclub channel
+    # Find channel
     channel = None
     async for dialog in client.iter_dialogs():
         if '100x' in dialog.name.lower():
@@ -151,7 +548,7 @@ async def main():
 
     if not channel:
         print("[ERROR] Could not find 100xclub channel!")
-        print("[INFO] Make sure you've joined the channel with this account")
+        await client.disconnect()
         return
 
     channel_id = channel.id
@@ -163,22 +560,66 @@ async def main():
         text = message.text or ''
 
         print(f"\n[NEW MESSAGE] {datetime.now().isoformat()}")
-        print(f"Text preview: {text[:100]}...")
+        print(f"Text: {text[:100]}...")
 
-        signal = parse_trade_signal(text)
-        if signal:
+        # Analyze media
+        media_analysis = None
+
+        # Check for photos/charts
+        if message.photo and GROQ_API_KEY:
+            try:
+                photo_bytes = await client.download_media(message.photo, bytes)
+                media_analysis = await analyze_chart_image(photo_bytes, GROQ_API_KEY)
+                if media_analysis:
+                    print(f"[CHART] {media_analysis}")
+            except Exception as e:
+                print(f"[WARN] Could not analyze image: {e}")
+
+        # Check for videos
+        if message.video and GROQ_API_KEY:
+            try:
+                video_size = getattr(message.video, 'size', 0)
+                if video_size and video_size < 50 * 1024 * 1024:
+                    print(f"[VIDEO] Downloading ({video_size / 1024 / 1024:.1f}MB)...")
+                    video_bytes = await client.download_media(message.video, bytes)
+                    video_analysis = await transcribe_video(video_bytes, GROQ_API_KEY)
+                    if video_analysis:
+                        print(f"[VIDEO] Transcription: {video_analysis.get('coins')} - {video_analysis.get('direction')}")
+                        # Append transcription to text
+                        if video_analysis.get('transcription'):
+                            text = text + "\n\n[VIDEO]:\n" + video_analysis['transcription']
+                        # Merge analysis
+                        if not media_analysis:
+                            media_analysis = {}
+                        if video_analysis.get('coins'):
+                            existing = media_analysis.get('coins', [])
+                            media_analysis['coins'] = list(set(existing + video_analysis['coins']))
+                        if video_analysis.get('direction'):
+                            media_analysis['direction'] = video_analysis['direction']
+                        if video_analysis.get('risk_reward'):
+                            media_analysis['risk_reward'] = video_analysis['risk_reward']
+                        media_analysis['has_video'] = True
+                else:
+                    print(f"[VIDEO] Skipping large video")
+            except Exception as e:
+                print(f"[WARN] Could not transcribe video: {e}")
+
+        # Detect signal
+        signal = SignalDetector.detect(text, media_analysis)
+
+        if signal and signal['detected']:
             signal['timestamp'] = datetime.now().isoformat()
             signal['message_id'] = message.id
-
-            print(f"[SIGNAL DETECTED] {signal['coins']} - {signal['direction']}")
+            print(f"[SIGNAL] {signal['coins']} - {signal['direction']} ({signal['action']})")
             await send_telegram_notification(signal)
         else:
             print("[INFO] Not a trade signal")
 
-    print("\n[RUNNING] Listening for new messages...")
-    print("Running on Render.com - 24/7\n")
+    print("\n[RUNNING] Listening for new messages in real-time...")
+    print("[INFO] Running on Render.com - 24/7\n")
 
     await client.run_until_disconnected()
+
 
 if __name__ == '__main__':
     asyncio.run(main())
