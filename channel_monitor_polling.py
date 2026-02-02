@@ -483,6 +483,268 @@ def extract_signals_from_transcription(transcription):
 
 
 # ============================================
+# YOUTUBE VIDEO DETECTION & TRANSCRIPTION
+# ============================================
+
+# Fefe's YouTube channel ID
+YOUTUBE_CHANNEL_ID = 'UC4p8s5ecGS4VWBP5QUvgehg'  # 100X Club channel
+YOUTUBE_CHANNEL_URL = 'https://www.youtube.com/@100XClub'
+
+# Patterns that indicate Fefe posted a new video
+VIDEO_MENTION_PATTERNS = [
+    r'\bvideo\s+is\s+up\b',
+    r'\bupdate\s+is\s+up\b',
+    r'\bdaily\s+update\s+is\s+up\b',
+    r'\bmarket\s+update\s+is\s+up\b',
+    r'\bjust\s+dropped\s+(?:a\s+)?video\b',
+    r'\bpublished\s+(?:the\s+)?video\b',
+    r'\bcheck\s+(?:out\s+)?(?:the\s+)?(?:new\s+)?video\b',
+    r'\bwatch\s+(?:the\s+)?(?:today.?s\s+)?(?:show|video|update)\b',
+    r'\bon\s+the\s+100\s*x\s*club\b',
+    r'\bon\s+the\s+channel\b',
+]
+
+# File to track processed video IDs (avoid re-processing)
+PROCESSED_VIDEOS_FILE = '/tmp/processed_youtube_videos.txt'
+
+
+def check_video_mention(text):
+    """Check if text mentions a new video being posted"""
+    text_lower = text.lower()
+    for pattern in VIDEO_MENTION_PATTERNS:
+        if re.search(pattern, text_lower, re.IGNORECASE):
+            return True
+    return False
+
+
+def get_processed_videos():
+    """Get list of already processed YouTube video IDs"""
+    try:
+        if os.path.exists(PROCESSED_VIDEOS_FILE):
+            with open(PROCESSED_VIDEOS_FILE, 'r') as f:
+                return set(line.strip() for line in f if line.strip())
+    except:
+        pass
+    return set()
+
+
+def mark_video_processed(video_id):
+    """Mark a video ID as processed"""
+    try:
+        with open(PROCESSED_VIDEOS_FILE, 'a') as f:
+            f.write(f"{video_id}\n")
+    except:
+        pass
+
+
+async def get_latest_youtube_video():
+    """
+    Fetch the latest video from Fefe's 100X Club YouTube channel
+    Returns: dict with video_id, title, url, published_at
+    """
+    try:
+        # Use yt-dlp to get channel info
+        result = subprocess.run(
+            ['yt-dlp', '--flat-playlist', '--print', '%(id)s', '--print', '%(title)s',
+             '--playlist-items', '1', YOUTUBE_CHANNEL_URL + '/videos'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0:
+            lines = result.stdout.strip().split('\n')
+            if len(lines) >= 2:
+                video_id = lines[0].strip()
+                title = lines[1].strip()
+                return {
+                    'video_id': video_id,
+                    'title': title,
+                    'url': f'https://www.youtube.com/watch?v={video_id}'
+                }
+
+        print(f"[YOUTUBE] yt-dlp output: {result.stdout[:200]}")
+        print(f"[YOUTUBE] yt-dlp stderr: {result.stderr[:200]}")
+
+    except subprocess.TimeoutExpired:
+        print("[YOUTUBE] Timeout fetching channel info")
+    except FileNotFoundError:
+        print("[YOUTUBE] yt-dlp not installed")
+    except Exception as e:
+        print(f"[YOUTUBE] Error fetching channel: {e}")
+
+    return None
+
+
+async def download_youtube_audio(video_url, max_duration=900):
+    """
+    Download audio from YouTube video
+    Returns: path to audio file or None
+    """
+    try:
+        # First check video duration
+        result = subprocess.run(
+            ['yt-dlp', '--print', 'duration', video_url],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0:
+            try:
+                duration = int(result.stdout.strip())
+                if duration > max_duration:
+                    print(f"[YOUTUBE] Video too long ({duration}s > {max_duration}s), skipping")
+                    return None
+            except:
+                pass
+
+        # Download audio
+        audio_path = tempfile.mktemp(suffix='.mp3')
+        result = subprocess.run(
+            ['yt-dlp', '-x', '--audio-format', 'mp3', '--audio-quality', '5',
+             '-o', audio_path.replace('.mp3', '.%(ext)s'), video_url],
+            capture_output=True,
+            text=True,
+            timeout=180  # 3 minutes for download
+        )
+
+        # yt-dlp might save with different extension first
+        possible_paths = [
+            audio_path,
+            audio_path.replace('.mp3', '.webm'),
+            audio_path.replace('.mp3', '.m4a'),
+        ]
+
+        for path in possible_paths:
+            mp3_path = path.replace('.webm', '.mp3').replace('.m4a', '.mp3')
+            if os.path.exists(mp3_path):
+                return mp3_path
+            if os.path.exists(path):
+                return path
+
+        print(f"[YOUTUBE] Download failed: {result.stderr[:200]}")
+        return None
+
+    except subprocess.TimeoutExpired:
+        print("[YOUTUBE] Download timeout")
+    except Exception as e:
+        print(f"[YOUTUBE] Download error: {e}")
+
+    return None
+
+
+async def transcribe_youtube_video(video_url, groq_api_key):
+    """
+    Download and transcribe a YouTube video
+    Returns: dict with transcription and extracted signals
+    """
+    if not groq_api_key:
+        return None
+
+    print(f"[YOUTUBE] Downloading audio from: {video_url}")
+    audio_path = await download_youtube_audio(video_url)
+
+    if not audio_path or not os.path.exists(audio_path):
+        return None
+
+    try:
+        # Check file size
+        audio_size = os.path.getsize(audio_path)
+        print(f"[YOUTUBE] Audio size: {audio_size / 1024 / 1024:.2f}MB")
+
+        if audio_size > 25 * 1024 * 1024:
+            print("[YOUTUBE] Audio too large for Groq (max 25MB)")
+            os.unlink(audio_path)
+            return None
+
+        # Read and transcribe
+        with open(audio_path, 'rb') as f:
+            audio_bytes = f.read()
+
+        # Cleanup
+        os.unlink(audio_path)
+
+        # Transcribe with Groq
+        from aiohttp import FormData
+
+        data = FormData()
+        data.add_field('file', audio_bytes, filename='audio.mp3', content_type='audio/mpeg')
+        data.add_field('model', 'whisper-large-v3-turbo')
+        data.add_field('response_format', 'json')
+        data.add_field('language', 'en')
+        data.add_field('prompt', 'Cryptocurrency trading video by Fefe discussing BTC Bitcoin ETH Ethereum SOL Solana LINK Chainlink, entries, stop losses, and risk reward ratios.')
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                'https://api.groq.com/openai/v1/audio/transcriptions',
+                headers={'Authorization': f'Bearer {groq_api_key}'},
+                data=data
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    transcription = result.get('text', '')
+                    print(f"[YOUTUBE] Transcribed {len(transcription)} chars")
+
+                    # Extract signals
+                    signals = extract_signals_from_transcription(transcription)
+
+                    # Also look for specific entry prices mentioned
+                    entries = extract_entry_prices(transcription)
+
+                    return {
+                        'transcription': transcription,
+                        'coins': signals.get('coins', []),
+                        'direction': signals.get('direction'),
+                        'risk_reward': signals.get('risk_reward'),
+                        'entries': entries,
+                        'has_youtube': True,
+                    }
+                else:
+                    print(f"[YOUTUBE] Transcription failed: {response.status}")
+                    return None
+
+    except Exception as e:
+        print(f"[YOUTUBE] Transcription error: {e}")
+        if audio_path and os.path.exists(audio_path):
+            os.unlink(audio_path)
+        return None
+
+
+def extract_entry_prices(transcription):
+    """Extract specific entry prices from transcription"""
+    entries = {}
+
+    # Pattern: "long Bitcoin 77750" or "Bitcoin at 77750"
+    patterns = [
+        r'\b(long|short)\s+(bitcoin|btc|ethereum|eth|solana|sol|link)\s+(?:at\s+)?(\d{2,6}(?:\.\d+)?)\b',
+        r'\b(bitcoin|btc|ethereum|eth|solana|sol|link)\s+(?:at\s+)?(\d{2,6}(?:\.\d+)?)\b',
+        r'\b(bitcoin|btc|ethereum|eth|solana|sol|link)\s+(?:entry|entered)\s+(?:at\s+)?(\d{2,6}(?:\.\d+)?)\b',
+    ]
+
+    text = transcription.lower()
+
+    # Map common names to symbols
+    name_to_symbol = {
+        'bitcoin': 'BTC', 'btc': 'BTC',
+        'ethereum': 'ETH', 'eth': 'ETH',
+        'solana': 'SOL', 'sol': 'SOL',
+        'link': 'LINK', 'chainlink': 'LINK',
+    }
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            groups = match.groups()
+            if len(groups) >= 2:
+                coin_name = groups[-2] if len(groups) == 3 else groups[0]
+                price = groups[-1]
+                symbol = name_to_symbol.get(coin_name.lower(), coin_name.upper())
+                entries[symbol] = price
+
+    return entries
+
+
+# ============================================
 # NOTIFICATION
 # ============================================
 
@@ -513,7 +775,16 @@ async def send_telegram_notification(signal_data):
     if signal_data.get('risk_reward'):
         message_parts.append(f"Risk/Reward: {signal_data['risk_reward']}")
 
-    if signal_data.get('has_video'):
+    if signal_data.get('entries'):
+        message_parts.append(f"")
+        message_parts.append(f"*Entry Prices:*")
+        for coin, price in signal_data['entries'].items():
+            message_parts.append(f"  {coin}: ${price}")
+
+    if signal_data.get('has_youtube'):
+        message_parts.append(f"")
+        message_parts.append(f"*[From YouTube Video]*")
+    elif signal_data.get('has_video'):
         message_parts.append(f"")
         message_parts.append(f"*[From Video Analysis]*")
 
@@ -593,12 +864,47 @@ async def main():
     print(f"[INFO] Checking messages since {cutoff_time.isoformat()}...")
 
     signals_found = 0
+    processed_videos = get_processed_videos()
 
     async for message in client.iter_messages(channel, limit=50):
         if message.date.replace(tzinfo=None) < cutoff_time:
             break
 
         text = message.text or ''
+
+        # Check if message mentions a video being posted
+        youtube_analysis = None
+        if check_video_mention(text) and GROQ_API_KEY:
+            print(f"[YOUTUBE] Detected video mention: {text[:100]}...")
+
+            # First check if there's a YouTube link in the message
+            youtube_match = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})', text)
+            if youtube_match:
+                video_id = youtube_match.group(1)
+                video_url = f'https://www.youtube.com/watch?v={video_id}'
+            else:
+                # No link in message, fetch latest from channel
+                print("[YOUTUBE] No link in message, fetching latest video from channel...")
+                latest = await get_latest_youtube_video()
+                if latest:
+                    video_id = latest['video_id']
+                    video_url = latest['url']
+                    print(f"[YOUTUBE] Latest video: {latest['title']}")
+                else:
+                    video_id = None
+                    video_url = None
+
+            # Process video if not already done
+            if video_id and video_id not in processed_videos:
+                print(f"[YOUTUBE] Processing video: {video_id}")
+                youtube_analysis = await transcribe_youtube_video(video_url, GROQ_API_KEY)
+                if youtube_analysis:
+                    mark_video_processed(video_id)
+                    # Append transcription to text for signal detection
+                    if youtube_analysis.get('transcription'):
+                        text = text + "\n\n[YOUTUBE VIDEO TRANSCRIPTION]:\n" + youtube_analysis['transcription'][:2000]
+            elif video_id:
+                print(f"[YOUTUBE] Video {video_id} already processed, skipping")
 
         # Check for images/charts
         image_analysis = None
@@ -631,7 +937,7 @@ async def main():
             except Exception as e:
                 print(f"[WARN] Could not transcribe video: {e}")
 
-        # Combine image and video analysis
+        # Combine all analysis (image, video, youtube)
         combined_analysis = image_analysis
         if video_analysis:
             if not combined_analysis:
@@ -647,6 +953,21 @@ async def main():
             combined_analysis['has_video'] = True
             combined_analysis['transcription'] = video_analysis.get('transcription', '')[:500]
 
+        # Merge YouTube analysis
+        if youtube_analysis:
+            if not combined_analysis:
+                combined_analysis = {}
+            if youtube_analysis.get('coins'):
+                existing_coins = combined_analysis.get('coins', [])
+                combined_analysis['coins'] = list(set(existing_coins + youtube_analysis['coins']))
+            if youtube_analysis.get('direction') and not combined_analysis.get('direction'):
+                combined_analysis['direction'] = youtube_analysis['direction']
+            if youtube_analysis.get('risk_reward'):
+                combined_analysis['risk_reward'] = youtube_analysis['risk_reward']
+            if youtube_analysis.get('entries'):
+                combined_analysis['entries'] = youtube_analysis['entries']
+            combined_analysis['has_youtube'] = True
+
         # Detect signal
         signal = SignalDetector.detect(text, combined_analysis)
 
@@ -658,6 +979,13 @@ async def main():
                 signal['has_video'] = True
                 if video_analysis.get('risk_reward'):
                     signal['risk_reward'] = video_analysis['risk_reward']
+            # Add YouTube-specific info
+            if youtube_analysis:
+                signal['has_youtube'] = True
+                if youtube_analysis.get('risk_reward'):
+                    signal['risk_reward'] = youtube_analysis['risk_reward']
+                if youtube_analysis.get('entries'):
+                    signal['entries'] = youtube_analysis['entries']
             signals_found += 1
 
             print(f"[SIGNAL] {signal['coins']} - {signal['direction']} ({signal['action']})")

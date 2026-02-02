@@ -14,7 +14,7 @@ concurrency:
 jobs:
   check-signals:
     runs-on: ubuntu-latest
-    timeout-minutes: 4  # Kill job if it runs too long
+    timeout-minutes: 8  # Increased for YouTube processing
 
     steps:
       - name: Checkout code
@@ -25,8 +25,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install telethon aiohttp
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install telethon aiohttp yt-dlp
 
       - name: Check for trade signals
         env:
