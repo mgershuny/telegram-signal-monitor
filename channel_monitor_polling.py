@@ -105,6 +105,14 @@ class SignalDetector:
         'action_verbs': ['took', 'taking', 'entered', 'entering', 'closed', 'closing', 'added', 'reduced', 'exited'],
     }
 
+    # Intent patterns - detect trading intent even without coin name
+    INTENT_PATTERNS = [
+        (r'\b(i am|im|i\'m)\s+(longing|shorting|long|short)\b', 'self_action'),
+        (r'\b(longing|shorting)\s+(here|now|this)?\b', 'action_now'),
+        (r'\b(going|went)\s+(long|short)\b', 'going_direction'),
+        (r'\bam\s+(long|short)\b', 'am_position'),
+    ]
+
     @classmethod
     def detect(cls, text, image_analysis=None):
         if not text or len(text) < 5:
@@ -139,12 +147,27 @@ class SignalDetector:
             result['chart_analysis'] = image_analysis
             if image_analysis.get('coins'):
                 for coin in image_analysis['coins']:
-                    if coin.upper() not in result['coins']:
+                    if coin.upper() not in result['coins'] and coin.upper() != 'UNKNOWN':
                         result['coins'].append(coin.upper())
                         tradeable_coins.append(coin.upper())
             if image_analysis.get('direction'):
                 result['direction'] = image_analysis['direction']
             result['confidence'] += 30
+
+        # Check for intent patterns (trading intent without coin name)
+        for pattern, method_name in cls.INTENT_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                result['methods'].append(f'intent:{method_name}')
+                result['confidence'] += 35
+                groups = match.groups()
+                for g in groups:
+                    if g and g.lower() in ['long', 'longing']:
+                        result['direction'] = 'LONG'
+                        result['action'] = 'OPEN'
+                    elif g and g.lower() in ['short', 'shorting']:
+                        result['direction'] = 'SHORT'
+                        result['action'] = 'OPEN'
 
         if not tradeable_coins:
             return None
